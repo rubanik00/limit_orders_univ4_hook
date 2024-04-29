@@ -26,6 +26,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         pendingOrders;
     mapping(uint256 positionId => uint256 claimsSupply) public claimTokensSupply;
     mapping(uint256 positionId => uint256 outputClaimable) public claimableOutputTokens;
+    mapping(PoolId poolId => int24 lastTick) public lastTicks;
 
     // Errors
     error InvalidOrder();
@@ -57,7 +58,8 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         poolManagerOnly
         returns (bytes4)
     {
-        // TODO
+        // Set the tick at initialization to be the last known tick for this pool
+        lastTicks[key.toId()] = tick;
         return this.afterInitialize.selector;
     }
 
@@ -68,8 +70,89 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         BalanceDelta,
         bytes calldata
     ) external override poolManagerOnly returns (bytes4) {
-        // TODO
+        // `sender` is the address which initiated the swap
+        // if `sender` is the hook, we don't want to go down the `afterSwap`
+        // rabbit hole again
+        if (sender == address(this)) return this.afterSwap.selector;
+
+        // Should we try to find and execute orders? True initially
+        bool tryMore = true;
+        int24 tickAfterExecutingOrder;
+
+        while (tryMore) {
+            // Try executing pending orders for this pool
+
+            // `tryMore` is true if we successfully found and executed an order
+            // which shifted the tick value
+            // and therefore we need to look again if there are any pending orders
+            // within the new tick range
+
+            // `tickAfterExecutingOrder` is the tick value of the pool
+            // after executing an order
+            // if no order was executed, `tickAfterExecutingOrder` will be
+            // the same as current tick
+            (tryMore, tickAfterExecutingOrder) = tryExecutingOrders(key, !params.zeroForOne);
+
+            // New last known tick for this pool is the tick value
+            // after executing an order
+        }
+        lastTicks[key.toId()] = tickAfterExecutingOrder;
+
         return this.afterSwap.selector;
+    }
+
+    function tryExecutingOrders(PoolKey calldata key, bool executeZeroForOne)
+        internal
+        returns (bool tryMore, int24 newTick)
+    {
+        (, int24 currentTick,,) = poolManager.getSlot0(key.toId());
+        int24 lastTick = lastTicks[key.toId()];
+
+        // Given `currentTick` and `lastTick`, 2 cases are possible:
+        // Case (1) - Tick has increased, i.e. `currentTick > lastTick`
+        // or, Case (2) - Tick has decreased, i.e. `currentTick < lastTick`
+
+        // If tick increases => Token 0 price has increased
+        // => We should check if we have orders looking to sell Token 0
+        // i.e. orders with zeroForOne = true
+
+        // If tick decreases => Token 1 price has increased
+        // => We should check if we have orders looking to sell Token 1
+        // i.e. orders with zeroForOne = false
+
+        // Tick has increased i.e. people sold Token 1 to buy Token 0
+        // i.e. Token 0 price has increased
+        // We should check if we have any orders looking to sell Token 0
+        // at ticks `lastTick` to `currentTick`
+        if (currentTick > lastTick) {
+            // Loop over all ticks from `lastTick` to `currentTick`
+            // and execute orders that are looking to sell Token 0
+            for (int24 tick = lastTick; tick < currentTick; tick += key.tickSpacing) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][executeZeroForOne];
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+
+                    // Return true because we may have more orders to execute
+                    // from lastTick to new current tick
+                    return (true, currentTick);
+                }
+            }
+        }
+        // Tick has gone down i.e. people sold Token 0 to buy Token 1
+        // i.e. Token 1 price has increased
+        // We should check if we have any orders looking to sell Token 1
+        // at ticks `currentTick` to `lastTick`
+        else {
+            for (int24 tick = lastTick; tick > currentTick; tick -= key.tickSpacing) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][executeZeroForOne];
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+                    return (true, currentTick);
+                }
+            }
+        }
+
+        return (false, currentTick);
     }
 
     function getLowerUsableTick(int24 tick, int24 tickSpacing) private pure returns (int24) {
